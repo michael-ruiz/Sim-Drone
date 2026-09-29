@@ -48,16 +48,18 @@ u.Thrust = hoverThrust;
 
 %% 3. Mission & Global Route (street-level waypoints from city_map.mat)
 startXY  = [0; 0];
-goalXY   = [80; 110];  % Street intersection behind a city block from the start
-useRoute = true;       % false = pure reactive VLM toward the goal (no map)
+goalXY   = [40; 112];  % Street behind a city block; reactive mode turns into a wall at X=40
+useRoute = false;      % false = pure reactive VLM toward the goal (no map)
 
 cityMap = [];
-route   = goalXY';
+if isfile("city_map.mat")
+    cityMap = load("city_map.mat"); % Also used as the post-flight plot background
+end
+route = goalXY';
 if useRoute
-    if ~isfile("city_map.mat")
+    if isempty(cityMap)
         error("city_map.mat not found - run map_city_block.m first.");
     end
-    cityMap = load("city_map.mat");
     % Anything taller than 10 m blocks a 12 m cruise; keep 4 m from walls
     route  = planRoute(cityMap, startXY', goalXY', 10, 4);
     goalXY = route(end, :)'; % Planner snaps the goal to the nearest free street cell
@@ -158,8 +160,12 @@ if ~isempty(histData)
         colormap(ax, flipud(gray)); clim(ax, [0 60]);
         cbMap = colorbar(ax); ylabel(cbMap, "Building height (m)");
     end
-    hRoute = plot(ax, [startXY(2); route(:,2)], [startXY(1); route(:,1)], "--o", ...
-                  Color=[1 0.55 0], LineWidth=1.5, MarkerFaceColor=[1 0.55 0]);
+    hRoute = gobjects(0);
+    if useRoute
+        hRoute = plot(ax, [startXY(2); route(:,2)], [startXY(1); route(:,1)], "--o", ...
+                      Color=[1 0.55 0], LineWidth=1.5, MarkerFaceColor=[1 0.55 0], ...
+                      DisplayName="Planned Route");
+    end
     hPath  = plot(ax, histData(:,2), histData(:,1), "b-", LineWidth=2);
     repPts = histData(:,4) == 1;
     vlmPts = histData(:,4) == 2;
@@ -170,10 +176,10 @@ if ~isempty(histData)
     hGoal = plot(ax, goalXY(2), goalXY(1), "kp", MarkerSize=18, MarkerFaceColor="y");
     axis(ax, "equal"); set(ax, YDir="normal");
     xlabel(ax, "Y (m, east)"); ylabel(ax, "X (m, north)");
-    title(ax, "Top-Down Path (Route + VLM Decisions + Depth Reflex)");
-    legend([hRoute, hPath, hRep, hEsc, hVLM, hGoal], ...
-           ["Planned Route", "Flight Path", "Depth Reflex Active", "Escape", "VLM Query Point", ...
-            sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))], Location="bestoutside");
+    title(ax, ternary(useRoute, "Top-Down Path (Route-Guided VLM)", "Top-Down Path (Reactive VLM, No Route)"));
+    set([hPath, hRep, hEsc, hVLM, hGoal], {"DisplayName"}, ...
+        {"Flight Path"; "Depth Reflex Active"; "Escape"; "VLM Query Point"; sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))});
+    legend([hRoute, hPath, hRep, hEsc, hVLM, hGoal], Location="bestoutside");
 
     exportgraphics(fig2, "vlm_run.png", Resolution=150);
     fprintf("Trajectory plot saved to vlm_run.png\n");

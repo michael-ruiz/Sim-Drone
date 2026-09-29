@@ -25,7 +25,7 @@ hStatus = text(axRGB, 12, 28, "INITIALIZING...", Color="g", ...
                FontWeight="bold", FontSize=10, BackgroundColor="k");
 hVLMText = text(axRGB, 12, 450, "VLM: Waiting for takeoff...", Color="c", ...
                 FontWeight="bold", FontSize=10, BackgroundColor="k");
-title(axRGB, "Onboard RGB + Visual Prompting Sectors [1-5]");
+title(axRGB, "Onboard RGB + Sector HUD [1-5] (HUD only, not sent to VLM)");
 
 axDepth = nexttile(tLayout, 2);
 hDepth = imagesc(axDepth, zeros(480, 640), [0 45]);
@@ -46,9 +46,28 @@ hoverThrust = model.Configuration.Mass * e.Gravity;
 s(13) = hoverThrust;
 u.Thrust = hoverThrust;
 
-%% 3. Create Unreal Engine World & Camera
+%% 3. Mission & Global Route (street-level waypoints from city_map.mat)
+startXY  = [0; 0];
+goalXY   = [80; 110];  % Street intersection behind a city block from the start
+useRoute = true;       % false = pure reactive VLM toward the goal (no map)
+
+cityMap = [];
+route   = goalXY';
+if useRoute
+    if ~isfile("city_map.mat")
+        error("city_map.mat not found - run map_city_block.m first.");
+    end
+    cityMap = load("city_map.mat");
+    % Anything taller than 10 m blocks a 12 m cruise; keep 4 m from walls
+    route  = planRoute(cityMap, startXY', goalXY', 10, 4);
+    goalXY = route(end, :)'; % Planner snaps the goal to the nearest free street cell
+    fprintf("Route: %d waypoints -> %s\n", size(route, 1), ...
+            strjoin(compose("(%.0f, %.0f)", route(:,1), route(:,2)), " -> "));
+end
+
+%% 4. Create Unreal Engine World & Camera
 sampleTime = 1/20; % 20 Hz low-level physics & depth reflex
-stopTime   = 45;   % 45-second cross-city flight
+stopTime   = 90;   % Long enough for the ~190 m street route
 
 world = sim3d.World(Scene="USCityBlock", ...
                     Output=@(w) stepUAVPhysics(w, sampleTime), ...
@@ -59,15 +78,19 @@ cam = sim3d.sensors.Camera(ActorName="DroneCamera", ...
                            FocalLength=[450 450], ...
                            OpticalCenter=[320 240], ...
                            EnableDepthOutput=true);
-cam.Translation = [0 0 2];
+cam.Translation = [startXY', 2];
 add(world, cam);
 
 % Shared State & VLM Configuration
 world.UserData.Time          = 0;
 world.UserData.LastVLMTime   = -10;
 world.UserData.VLMInterval   = 2.0;        % Query VLM every 2.0 seconds of sim time
-world.UserData.GoalXY        = [120; 0];   % Destination on the other side of the city
-world.UserData.ChosenSector  = 3;          % 1=Far Left, 2=Left, 3=Center, 4=Right, 5=Far Right
+world.UserData.GoalXY        = goalXY;
+world.UserData.Route         = route;      % Kx2 waypoints [x y]; last row is the goal
+world.UserData.WaypointIdx   = 1;
+world.UserData.WaypointRadius = 5.0;       % Advance to the next waypoint within 5 m
+world.UserData.UseRoute      = useRoute;
+world.UserData.ChosenSector  = 3;          % 0=Blocked, 1=Far Left, 2=Left, 3=Center, 4=Right, 5=Far Right
 world.UserData.VLMHeading    = 0;          % World yaw commanded by VLM (radians)
 world.UserData.VLMReason     = "Initial climb to cruise altitude";
 world.UserData.OllamaModel   = "qwen2.5vl:3b"; % Also tried: "llava" (strong sector-2 bias, ignored depths)
@@ -78,8 +101,20 @@ world.UserData.Env           = e;
 world.UserData.HoverThrust   = hoverThrust;
 world.UserData.History       = [];
 world.UserData.Arrived       = false;
-world.UserData.Aligning      = false;      % True while rotating to bring the goal into the camera FOV
 world.UserData.GoalRadius    = 3.0;        % Hover once within 3m of the goal
+world.UserData.Aligning      = false;      % True while rotating to bring the target into the camera FOV
+% Route waypoints are line-of-sight, so keep them in view; without a route, only turn
+% around when the goal is behind so the drone can follow streets away from it.
+world.UserData.AlignEnterDeg = ternary(useRoute, 35, 90);
+world.UserData.Escaping      = false;      % Wall-following escape when blocked or stuck
+world.UserData.EscapeUntil   = -Inf;
+world.UserData.EscapeHeading = 0;
+world.UserData.EscapeDuration = 4.0;
+world.UserData.EscapeCount   = 0;
+world.UserData.StuckWindow   = 6.0;        % Stuck = under 2 m closer to the target in 6 s
+world.UserData.StuckMinProgress = 2.0;
+world.UserData.ProgressRefT  = 3.5;
+world.UserData.ProgressRefDist = Inf;
 
 % Warm up Ollama so the first in-flight query doesn't time out while the model loads
 try
@@ -91,7 +126,7 @@ catch ME
     fprintf("Ollama warm-up failed (%s) - using local fallback planner.\n", ME.message);
 end
 
-%% 4. Run Co-Simulation
+%% 5. Run Co-Simulation
 try
     run(world, sampleTime, stopTime);
 catch ME
@@ -99,32 +134,46 @@ catch ME
     rethrow(ME);
 end
 
-histData = world.UserData.History;
-goalXY   = world.UserData.GoalXY;
-arrived  = world.UserData.Arrived;
+histData    = world.UserData.History;
+arrived     = world.UserData.Arrived;
+escapeCount = world.UserData.EscapeCount;
+wpReached   = world.UserData.WaypointIdx - 1;
 delete(world);
 
-%% 5. Post-Flight Cross-City Map
+%% 6. Post-Flight Map (north/X up, east/Y right)
 if ~isempty(histData)
     finalDist = norm(histData(end,1:2)' - goalXY);
     fprintf("\n=== FLIGHT SUMMARY ===\n");
     fprintf("Final position: (%.1f, %.1f), altitude %.1f m\n", histData(end,1), histData(end,2), histData(end,3));
     fprintf("Final distance to goal: %.1f m | Goal reached: %s\n", finalDist, string(arrived));
+    fprintf("Waypoints passed: %d of %d | Escapes: %d\n", wpReached, size(route, 1) - 1, escapeCount);
     fprintf("VLM queries: %d | Steps with depth reflex active: %d of %d\n", ...
             nnz(histData(:,4) == 2), nnz(histData(:,4) == 1), size(histData, 1));
 
-    fig2 = figure(Name="Cross-City VLM Navigation Trajectory", Color="w");
-    plot(histData(:,1), histData(:,2), "b-", LineWidth=2);
-    hold on; grid on; axis equal;
-    vlmPts = histData(:,4) == 2;
+    fig2 = figure(Name="Cross-City VLM Navigation Trajectory", Color="w", Position=[100 60 900 800]);
+    ax = axes(fig2);
+    hold(ax, "on"); grid(ax, "on");
+    if ~isempty(cityMap)
+        imagesc(ax, cityMap.yCenters, cityMap.xCenters, min(cityMap.heightMap, 60));
+        colormap(ax, flipud(gray)); clim(ax, [0 60]);
+        cbMap = colorbar(ax); ylabel(cbMap, "Building height (m)");
+    end
+    hRoute = plot(ax, [startXY(2); route(:,2)], [startXY(1); route(:,1)], "--o", ...
+                  Color=[1 0.55 0], LineWidth=1.5, MarkerFaceColor=[1 0.55 0]);
+    hPath  = plot(ax, histData(:,2), histData(:,1), "b-", LineWidth=2);
     repPts = histData(:,4) == 1;
-    scatter(histData(repPts,1), histData(repPts,2), 25, "r", "filled");
-    scatter(histData(vlmPts,1), histData(vlmPts,2), 70, "g", "filled", "MarkerEdgeColor", "k");
-    plot(goalXY(1), goalXY(2), "kp", MarkerSize=16, MarkerFaceColor="y");
-    xlabel("X (m)"); ylabel("Y (m)");
-    title("Top-Down Cross-City Path (VLM Waypoints + Depth Safety Reflex)");
-    legend("Flight Path", "Depth Reflex Active", "VLM Query Point", ...
-           sprintf("City Goal (%g, %g)", goalXY(1), goalXY(2)), Location="best");
+    vlmPts = histData(:,4) == 2;
+    escPts = histData(:,4) == 3;
+    hRep = scatter(ax, histData(repPts,2), histData(repPts,1), 20, "r", "filled");
+    hEsc = scatter(ax, histData(escPts,2), histData(escPts,1), 20, "m", "filled");
+    hVLM = scatter(ax, histData(vlmPts,2), histData(vlmPts,1), 50, "g", "filled", MarkerEdgeColor="k");
+    hGoal = plot(ax, goalXY(2), goalXY(1), "kp", MarkerSize=18, MarkerFaceColor="y");
+    axis(ax, "equal"); set(ax, YDir="normal");
+    xlabel(ax, "Y (m, east)"); ylabel(ax, "X (m, north)");
+    title(ax, "Top-Down Path (Route + VLM Decisions + Depth Reflex)");
+    legend([hRoute, hPath, hRep, hEsc, hVLM, hGoal], ...
+           ["Planned Route", "Flight Path", "Depth Reflex Active", "Escape", "VLM Query Point", ...
+            sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))], Location="bestoutside");
 
     exportgraphics(fig2, "vlm_run.png", Resolution=150);
     fprintf("Trajectory plot saved to vlm_run.png\n");
@@ -148,7 +197,7 @@ end
 %% --- Callback 2: High-Level VLM Planner + 20 Hz Depth Safety Reflex ---
 function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, colEdges)
     [rgbFrame, depthFrame] = read(world.Actors.DroneCamera);
-    depthFrame = min(double(depthFrame), 45); % Clamp sky/Inf returns to the display range
+    depthFrame = min(double(depthFrame), 45); % uint8 meters; clamp sky (255) to the display range
 
     ud  = world.UserData;
     t   = ud.Time;
@@ -173,40 +222,72 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     if distToGoal < ud.GoalRadius
         ud.Arrived = true;
     end
+    active = (t > 3.5) && ~ud.Arrived;
 
-    % Relative angle to final city goal (+ is Right, - is Left)
-    goalHeading = atan2(vecToGoal(2), vecToGoal(1));
-    goalBearing = rad2deg(atan2(sin(goalHeading - yaw), cos(goalHeading - yaw)));
+    % Current target = next route waypoint (or the goal itself without a route)
+    target = ud.Route(ud.WaypointIdx, :)';
+    if ud.WaypointIdx < size(ud.Route, 1) && norm(target - pos(1:2)) < ud.WaypointRadius
+        ud.WaypointIdx = ud.WaypointIdx + 1;
+        target = ud.Route(ud.WaypointIdx, :)';
+        ud.ProgressRefT    = t;
+        ud.ProgressRefDist = norm(target - pos(1:2));
+        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) waypoint reached -> next waypoint %d at (%.0f, %.0f)\n", ...
+                t, pos(1), pos(2), ud.WaypointIdx, target(1), target(2));
+    end
+    vecToTarget   = target - pos(1:2);
+    distToTarget  = norm(vecToTarget);
+    targetHeading = atan2(vecToTarget(2), vecToTarget(1));
+    targetBearing = rad2deg(atan2(sin(targetHeading - yaw), cos(targetHeading - yaw))); % + is Right
 
-    % Goal outside the camera FOV -> no sector can make progress, so turn to face it first.
-    % Hysteresis: start aligning beyond 35 deg (FOV edge), resume VLM once within 10 deg.
-    if (t > 3.5) && ~ud.Arrived
-        if ~ud.Aligning && abs(goalBearing) > 35
+    % --- 2. ESCAPE / STUCK HANDLING ---
+    if ud.Escaping && t >= ud.EscapeUntil
+        ud.Escaping        = false;
+        ud.LastVLMTime     = -Inf; % Fresh VLM decision on the new view
+        ud.ProgressRefT    = t;
+        ud.ProgressRefDist = distToTarget;
+    end
+    if active && ~ud.Escaping && (t - ud.ProgressRefT) >= ud.StuckWindow
+        if ud.ProgressRefDist - distToTarget < ud.StuckMinProgress
+            ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, "stuck (no progress)");
+        end
+        ud.ProgressRefT    = t;
+        ud.ProgressRefDist = distToTarget;
+    end
+
+    % Target outside the view -> turn to face it first (hysteresis: resume VLM within 10 deg)
+    if active && ~ud.Escaping
+        if ~ud.Aligning && abs(targetBearing) > ud.AlignEnterDeg
             ud.Aligning = true;
-            fprintf("t=%5.1fs pos=(%6.1f, %6.1f) goal @ %+4.0f deg outside FOV -> turning to face goal\n", ...
-                    t, pos(1), pos(2), goalBearing);
-        elseif ud.Aligning && abs(goalBearing) < 10
+            fprintf("t=%5.1fs pos=(%6.1f, %6.1f) target @ %+4.0f deg -> turning to face it\n", ...
+                    t, pos(1), pos(2), targetBearing);
+        elseif ud.Aligning && abs(targetBearing) < 10
             ud.Aligning    = false;
             ud.LastVLMTime = -Inf; % Query the VLM immediately on the new view
         end
     end
 
-    % --- 2. HIGH-LEVEL VLM PLANNER (Runs Every 2.0s After Takeoff) ---
+    % --- 3. HIGH-LEVEL VLM PLANNER (Runs Every 2.0s After Takeoff) ---
     vlmTriggered = false;
-    if (t > 3.5) && ~ud.Arrived && ~ud.Aligning && ((t - ud.LastVLMTime) >= ud.VLMInterval)
+    if active && ~ud.Aligning && ~ud.Escaping && ((t - ud.LastVLMTime) >= ud.VLMInterval)
         ud.LastVLMTime = t;
         vlmTriggered   = true;
 
-        [chosenSector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, goalBearing, distToGoal, ud.OllamaModel);
+        targetLabel = ternary(ud.UseRoute, "next route waypoint", "destination");
+        [chosenSector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, targetBearing, ...
+                                                   distToTarget, targetLabel, ud.OllamaModel);
         ud.ChosenSector = chosenSector;
-        ud.VLMHeading   = yaw + sectorAngles(chosenSector);
         ud.VLMReason    = sprintf("[Sector %d] %s", chosenSector, reason);
-        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) goal=%5.1fm @ %+4.0f deg | depths=[%s] -> sector %d | %s\n", ...
-                t, pos(1), pos(2), distToGoal, goalBearing, ...
-                strjoin(compose("%.1f", sectorDepths), " "), chosenSector, reason);
+        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) target=%5.1fm @ %+4.0f deg | depths=[%s] -> sector %d | %s\n", ...
+                t, pos(1), pos(2), distToTarget, targetBearing, ...
+                strjoin(compose("%.0f", sectorDepths), " "), chosenSector, reason);
+        if chosenSector == 0
+            ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, "VLM reports all sectors blocked");
+        else
+            ud.VLMHeading = yaw + sectorAngles(chosenSector);
+        end
     end
 
-    % --- 3. COMBINE VLM HEADING WITH 20 Hz DEPTH REPULSION ---
+    % --- 4. COMBINE HEADING COMMAND WITH 20 Hz DEPTH REPULSION ---
     if t <= 3.5
         % Initial takeoff to 12m street cruise altitude
         vWorldCmd = -0.8 * pos(1:2);
@@ -222,10 +303,14 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         statusStr = sprintf("GOAL REACHED - HOVERING (%.1f m off)", distToGoal);
         statusCol = "c";
     else
-        if ud.Aligning
-            % Rotate in place toward the goal (repulsion still active)
+        if ud.Escaping
+            % Follow the wall toward the more promising side
+            vAttract  = 2.5 * [cos(ud.EscapeHeading); sin(ud.EscapeHeading)];
+            yawTarget = ud.EscapeHeading;
+        elseif ud.Aligning
+            % Rotate in place toward the target (repulsion still active)
             vAttract  = [0; 0];
-            yawTarget = goalHeading;
+            yawTarget = targetHeading;
         else
             % Attractive velocity along the VLM's chosen corridor heading
             vAttract  = 3.8 * [cos(ud.VLMHeading); sin(ud.VLMHeading)];
@@ -252,15 +337,19 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
             vWorldCmd = vWorldCmd * (4.0 / norm(vWorldCmd));
         end
 
-        statusStr = sprintf("GOAL DIST: %.1f m | Min Depth: %.1f m", distToGoal, min(sectorDepths));
-        if ud.Aligning
-            statusStr = sprintf("TURNING TO GOAL (%+.0f deg) | %s", goalBearing, statusStr);
+        statusStr = sprintf("WP %d/%d: %.1f m | GOAL: %.1f m | Min Depth: %.0f m", ...
+                            ud.WaypointIdx, size(ud.Route, 1), distToTarget, distToGoal, min(sectorDepths));
+        if ud.Escaping
+            statusStr = sprintf("ESCAPING (%.1f s) | %s", ud.EscapeUntil - t, statusStr);
+        elseif ud.Aligning
+            statusStr = sprintf("TURNING TO TARGET (%+.0f deg) | %s", targetBearing, statusStr);
         end
         statusCol = "g";
         if modeFlag == 1, statusCol = "r"; end
+        if ud.Escaping, statusCol = "m"; end
     end
 
-    % --- 4. ACTUATE: Multirotor Attitude & Altitude Control ---
+    % --- 5. ACTUATE: Multirotor Attitude & Altitude Control ---
     yawErr = atan2(sin(yawTarget - yaw), cos(yawTarget - yaw));
     u.YawRate = max(-1.8, min(1.8, 2.4 * yawErr));
 
@@ -277,13 +366,15 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     vzUpCurr = -vel(3);
     u.Thrust = max(0, ud.HoverThrust + ud.Model.Configuration.Mass * (6.0 * altErr - 3.8 * vzUpCurr));
 
+    % Log flags: 0 = normal, 1 = depth reflex, 2 = VLM query, 3 = escape
     logFlag = modeFlag;
+    if ud.Escaping, logFlag = 3; end
     if vlmTriggered, logFlag = 2; end
     ud.History = [ud.History; pos(1), pos(2), -pos(3), logFlag];
     ud.Control = u;
     world.UserData = ud;
 
-    % --- 5. UPDATE HUD ---
+    % --- 6. UPDATE HUD ---
     if isvalid(hRGB)
         set(hRGB, CData=rgbFrame);
         set(hDepth, CData=depthFrame);
@@ -303,8 +394,27 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     end
 end
 
-%% --- Helper: Query Local Ollama VLM (with Built-In Vision Heuristic Fallback) ---
-function [sector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, goalBearingDeg, distToGoal, modelName)
+%% --- Helper: Start a Wall-Following Escape ---
+function ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, why)
+    % Turn 90 deg toward the side the target is on; if it's dead ahead, take the more open side
+    if abs(targetBearing) > 5
+        side = sign(targetBearing);
+    elseif mean(sectorDepths(4:5)) > mean(sectorDepths(1:2))
+        side = 1;
+    else
+        side = -1;
+    end
+    ud.Escaping      = true;
+    ud.Aligning      = false;
+    ud.EscapeHeading = yaw + side * pi/2;
+    ud.EscapeUntil   = t + ud.EscapeDuration;
+    ud.EscapeCount   = ud.EscapeCount + 1;
+    fprintf("t=%5.1fs pos=(%6.1f, %6.1f) ESCAPE %d: %s -> turning %s for %.0f s\n", ...
+            t, pos(1), pos(2), ud.EscapeCount, why, ternary(side > 0, "right", "left"), ud.EscapeDuration);
+end
+
+%% --- Helper: Query Local Ollama VLM (with Depth + Bearing Fallback) ---
+function [sector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, bearingDeg, distToTarget, targetLabel, modelName)
     % Encode current RGB frame as Base64 JPEG for the VLM API
     tmpFile = [tempname, '.jpg'];
     imwrite(imresize(rgbFrame, 0.5), tmpFile, 'Quality', 80);
@@ -315,13 +425,15 @@ function [sector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, goalBearin
     b64Image = matlab.net.base64encode(rawBytes);
 
     prompt = sprintf([ ...
-        'You are an autonomous urban drone navigator. The camera view is divided from left to right ', ...
+        'You are an autonomous urban drone navigator flying at 12 m altitude. The camera view is divided from left to right ', ...
         'into 5 sectors: 1 (Far Left, -28 deg), 2 (Left, -14 deg), 3 (Center, 0 deg), 4 (Right, +14 deg), 5 (Far Right, +28 deg). ', ...
-        'Measured LiDAR/Depth clearance in meters for sectors [1..5] is [%.1f, %.1f, %.1f, %.1f, %.1f]. ', ...
-        'The destination on the other side of the city is %.1f meters away at relative bearing %.0f degrees (+ is Right, - is Left). ', ...
-        'Pick the best open street sector (1, 2, 3, 4, or 5) that avoids buildings/poles and progresses toward the goal. ', ...
-        'Respond ONLY with valid JSON: {"sector": <int 1-5>, "reason": "<short 6-word explanation>"}'], ...
-        sectorDepths(1), sectorDepths(2), sectorDepths(3), sectorDepths(4), sectorDepths(5), distToGoal, goalBearingDeg);
+        'Measured depth clearance in meters for sectors [1..5] is [%.0f, %.0f, %.0f, %.0f, %.0f] (45 means 45 m or more). ', ...
+        'Your %s is %.1f meters away at relative bearing %.0f degrees (+ is Right, - is Left). ', ...
+        'Pick the open sector (1-5) that avoids buildings and is closest to that bearing. ', ...
+        'If every sector is blocked by a building or wall closer than 8 m, answer sector 0. ', ...
+        'Respond ONLY with valid JSON: {"sector": <int 0-5>, "reason": "<short 6-word explanation>"}'], ...
+        sectorDepths(1), sectorDepths(2), sectorDepths(3), sectorDepths(4), sectorDepths(5), ...
+        targetLabel, distToTarget, bearingDeg);
 
     try
         % Call local Ollama server (http://localhost:11434/api/generate)
@@ -340,14 +452,96 @@ function [sector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, goalBearin
         if ~isscalar(sec) || isnan(sec)
             error("VLM returned invalid sector: %s", resp.response);
         end
-        sector = max(1, min(5, round(double(sec))));
+        sector = max(0, min(5, round(double(sec))));
         reason = string(parsed.reason);
     catch ME
         fprintf("VLM query failed, using fallback: %s\n", ME.message);
-        % Automatic fallback if Ollama is not running yet: score sectors by depth clearance + goal alignment
-        sectorAnglesDeg = [-28, -14, 0, 14, 28];
-        scores = sectorDepths - 0.35 * abs(sectorAnglesDeg - goalBearingDeg);
-        [~, sector] = max(scores);
-        reason = "Open corridor toward city goal (Local Fallback)";
+        % Automatic fallback if Ollama is not running yet: score sectors by depth clearance + bearing alignment
+        if max(sectorDepths) < 8
+            sector = 0;
+            reason = "All sectors blocked (Local Fallback)";
+        else
+            sectorAnglesDeg = [-28, -14, 0, 14, 28];
+            scores = sectorDepths - 0.35 * abs(sectorAnglesDeg - bearingDeg);
+            [~, sector] = max(scores);
+            reason = "Open corridor toward target (Local Fallback)";
+        end
     end
+end
+
+%% --- Helper: Grid Route Planner over the City Height Map ---
+function waypoints = planRoute(map, startXY, goalXY, obstacleHeight, inflateRadius)
+    % Shortest 8-connected path over free cells, penalizing cells near walls,
+    % then pruned to line-of-sight corner waypoints. Returns Kx2 [x y] (goal last).
+    xs = map.xCenters; ys = map.yCenters; cs = map.cellSize;
+    occ = isnan(map.heightMap) | map.heightMap > obstacleHeight;
+    r = round(inflateRadius / cs);
+    blocked  = movmax(movmax(double(occ), 2*r + 1, 1), 2*r + 1, 2) > 0;
+    nearWall = movmax(movmax(double(occ), 4*r + 1, 1), 4*r + 1, 2) > 0;
+    [nx, ny] = size(blocked);
+
+    startCell = nearestFreeCell(blocked, xyToCell(startXY, xs, ys, cs));
+    goalCell  = nearestFreeCell(blocked, xyToCell(goalXY, xs, ys, cs));
+    snappedGoal = [xs(goalCell(1)), ys(goalCell(2))];
+    if norm(snappedGoal - goalXY) > cs
+        fprintf("Goal (%.0f, %.0f) is inside an obstacle - snapped to (%.0f, %.0f)\n", ...
+                goalXY(1), goalXY(2), snappedGoal(1), snappedGoal(2));
+    end
+
+    idx = reshape(1:nx*ny, nx, ny);
+    S = []; T = []; W = [];
+    for off = [1 0; 0 1; 1 1; 1 -1]'
+        di = off(1); dj = off(2);
+        i1 = max(1, 1 - di):min(nx, nx - di);
+        j1 = max(1, 1 - dj):min(ny, ny - dj);
+        a = idx(i1, j1); b = idx(i1 + di, j1 + dj);
+        ok = ~blocked(a) & ~blocked(b);
+        cost = hypot(di, dj) * (1 + 2 * (nearWall(a) | nearWall(b)));
+        S = [S; a(ok)]; T = [T; b(ok)]; W = [W; cost(ok)]; %#ok<AGROW>
+    end
+    G = graph(S, T, W, nx*ny);
+    path = shortestpath(G, idx(startCell(1), startCell(2)), idx(goalCell(1), goalCell(2)));
+    if isempty(path)
+        error("No street route found from (%.0f, %.0f) to (%.0f, %.0f).", ...
+              startXY(1), startXY(2), goalXY(1), goalXY(2));
+    end
+    [pi_, pj] = ind2sub([nx ny], path(:));
+    pts = [xs(pi_)', ys(pj)'];
+
+    % Greedy line-of-sight pruning to corner waypoints
+    waypoints = zeros(0, 2);
+    k = 1;
+    while k < size(pts, 1)
+        j = size(pts, 1);
+        while j > k + 1 && ~lineOfSight(blocked, pts(k,:), pts(j,:), xs, ys, cs)
+            j = j - 1;
+        end
+        waypoints(end+1, :) = pts(j, :); %#ok<AGROW>
+        k = j;
+    end
+end
+
+function c = xyToCell(p, xs, ys, cs)
+    c = [round((p(1) - xs(1)) / cs) + 1, round((p(2) - ys(1)) / cs) + 1];
+    c = min(max(c, [1 1]), [numel(xs) numel(ys)]);
+end
+
+function c = nearestFreeCell(blocked, c)
+    if ~blocked(c(1), c(2)), return; end
+    [fi, fj] = find(~blocked);
+    [~, k] = min((fi - c(1)).^2 + (fj - c(2)).^2);
+    c = [fi(k), fj(k)];
+end
+
+function ok = lineOfSight(blocked, p1, p2, xs, ys, cs)
+    n = max(2, ceil(norm(p2 - p1) / (0.5 * cs)));
+    px = linspace(p1(1), p2(1), n);
+    py = linspace(p1(2), p2(2), n);
+    ix = round((px - xs(1)) / cs) + 1;
+    iy = round((py - ys(1)) / cs) + 1;
+    ok = ~any(blocked(sub2ind(size(blocked), ix, iy)));
+end
+
+function out = ternary(cond, a, b)
+    if cond, out = a; else, out = b; end
 end

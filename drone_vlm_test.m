@@ -55,6 +55,21 @@ useRoute = true;       % false = pure reactive VLM toward the goal (no map)
 % [x y sizeX sizeY height] (m). This one blocks the road on the first route leg.
 unmappedObstacles = [40 2 4 8 20];
 
+% VLM configuration. Environment variables override the defaults for batch experiments:
+%   VLM_MODEL (e.g. qwen2.5vl:7b), VLM_OVERLAY (1 = draw numbered sectors into the image),
+%   VLM_RUN (log folder name under vlm_log/)
+vlmModel   = "qwen2.5vl:3b";   % Also tried: "llava" (strong sector-2 bias, ignored depths)
+vlmOverlay = false;
+if ~isempty(getenv("VLM_MODEL")),   vlmModel   = string(getenv("VLM_MODEL")); end
+if ~isempty(getenv("VLM_OVERLAY")), vlmOverlay = getenv("VLM_OVERLAY") == "1"; end
+runName = string(getenv("VLM_RUN"));
+if runName == ""
+    runName = string(datetime("now", Format="yyyyMMdd_HHmmss"));
+end
+logDir = fullfile("vlm_log", runName);   % Raw frames + per-query inputs for offline VLM benchmarking
+if ~isfolder(logDir), mkdir(logDir); end
+fprintf("VLM: %s | overlay: %s | log: %s\n", vlmModel, string(vlmOverlay), logDir);
+
 cityMap = [];
 if isfile("city_map.mat")
     cityMap = load("city_map.mat"); % Also used as the post-flight plot background
@@ -108,7 +123,10 @@ world.UserData.UseRoute      = useRoute;
 world.UserData.ChosenSector  = 3;          % 0=Blocked, 1=Far Left, 2=Left, 3=Center, 4=Right, 5=Far Right
 world.UserData.VLMHeading    = 0;          % World yaw commanded by VLM (radians)
 world.UserData.VLMReason     = "Initial climb to cruise altitude";
-world.UserData.OllamaModel   = "qwen2.5vl:3b"; % Also tried: "llava" (strong sector-2 bias, ignored depths)
+world.UserData.OllamaModel   = vlmModel;
+world.UserData.VLMOverlay    = vlmOverlay;
+world.UserData.LogDir        = logDir;
+world.UserData.QueryLog      = struct([]);
 world.UserData.Model         = model;
 world.UserData.State         = s;
 world.UserData.Control       = u;
@@ -154,7 +172,9 @@ histData    = world.UserData.History;
 arrived     = world.UserData.Arrived;
 escapeCount = world.UserData.EscapeCount;
 wpReached   = world.UserData.WaypointIdx - 1;
+queryLog    = world.UserData.QueryLog;
 delete(world);
+save(fullfile(logDir, "queries.mat"), "queryLog", "vlmModel", "vlmOverlay");
 
 %% 6. Post-Flight Map (north/X up, east/Y right)
 if ~isempty(histData)
@@ -165,6 +185,11 @@ if ~isempty(histData)
     fprintf("Waypoints passed: %d of %d | Escapes: %d\n", wpReached, size(route, 1) - 1, escapeCount);
     fprintf("VLM queries: %d | Steps with depth reflex active: %d of %d\n", ...
             nnz(histData(:,4) == 2), nnz(histData(:,4) == 1), size(histData, 1));
+    if ~isempty(queryLog)
+        fprintf("VLM latency: mean %.2f s, max %.2f s | Sector picks [0..5]: %s\n", ...
+                mean([queryLog.latency]), max([queryLog.latency]), ...
+                mat2str(histcounts([queryLog.sector], -0.5:1:5.5)));
+    end
 
     fig2 = figure(Name="Cross-City VLM Navigation Trajectory", Color="w", Position=[100 60 900 800]);
     ax = axes(fig2);
@@ -304,13 +329,26 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         vlmTriggered   = true;
 
         targetLabel = ternary(ud.UseRoute, "next route waypoint", "destination");
-        [chosenSector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, targetBearing, ...
-                                                   distToTarget, targetLabel, ud.OllamaModel);
+        [chosenSector, reason, latency] = queryVLMNavigator(rgbFrame, sectorDepths, targetBearing, ...
+                                              distToTarget, targetLabel, ud.OllamaModel, ud.VLMOverlay);
         ud.ChosenSector = chosenSector;
         ud.VLMReason    = sprintf("[Sector %d] %s", chosenSector, reason);
-        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) target=%5.1fm @ %+4.0f deg | depths=[%s] -> sector %d | %s\n", ...
+        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) target=%5.1fm @ %+4.0f deg | depths=[%s] -> sector %d (%.1fs) | %s\n", ...
                 t, pos(1), pos(2), distToTarget, targetBearing, ...
-                strjoin(compose("%.0f", sectorDepths), " "), chosenSector, reason);
+                strjoin(compose("%.0f", sectorDepths), " "), chosenSector, latency, reason);
+
+        % Log the raw frame + inputs so other models/prompts can be replayed offline
+        q = numel(ud.QueryLog) + 1;
+        imwrite(rgbFrame, fullfile(ud.LogDir, sprintf("q%03d.png", q)));
+        ud.QueryLog(q).t        = t;
+        ud.QueryLog(q).pos      = pos(1:2)';
+        ud.QueryLog(q).depths   = sectorDepths;
+        ud.QueryLog(q).bearing  = targetBearing;
+        ud.QueryLog(q).dist     = distToTarget;
+        ud.QueryLog(q).label    = targetLabel;
+        ud.QueryLog(q).sector   = chosenSector;
+        ud.QueryLog(q).reason   = reason;
+        ud.QueryLog(q).latency  = latency;
         if chosenSector == 0
             ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, "VLM reports all sectors blocked");
         else
@@ -446,62 +484,6 @@ function ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, why)
     ud.EscapeCount   = ud.EscapeCount + 1;
     fprintf("t=%5.1fs pos=(%6.1f, %6.1f) ESCAPE %d: %s -> turning %s for %.0f s\n", ...
             t, pos(1), pos(2), ud.EscapeCount, why, ternary(side > 0, "right", "left"), ud.EscapeDuration);
-end
-
-%% --- Helper: Query Local Ollama VLM (with Depth + Bearing Fallback) ---
-function [sector, reason] = queryVLMNavigator(rgbFrame, sectorDepths, bearingDeg, distToTarget, targetLabel, modelName)
-    % Encode current RGB frame as Base64 JPEG for the VLM API
-    tmpFile = [tempname, '.jpg'];
-    imwrite(imresize(rgbFrame, 0.5), tmpFile, 'Quality', 80);
-    fid = fopen(tmpFile, 'rb');
-    rawBytes = fread(fid, inf, '*uint8');
-    fclose(fid);
-    delete(tmpFile);
-    b64Image = matlab.net.base64encode(rawBytes);
-
-    prompt = sprintf([ ...
-        'You are an autonomous urban drone navigator flying at 12 m altitude. The camera view is divided from left to right ', ...
-        'into 5 sectors: 1 (Far Left, -28 deg), 2 (Left, -14 deg), 3 (Center, 0 deg), 4 (Right, +14 deg), 5 (Far Right, +28 deg). ', ...
-        'Measured depth clearance in meters for sectors [1..5] is [%.0f, %.0f, %.0f, %.0f, %.0f] (45 means 45 m or more). ', ...
-        'Your %s is %.1f meters away at relative bearing %.0f degrees (+ is Right, - is Left). ', ...
-        'Pick the open sector (1-5) that avoids buildings and is closest to that bearing. ', ...
-        'If every sector is blocked by a building or wall closer than 8 m, answer sector 0. ', ...
-        'Respond ONLY with valid JSON: {"sector": <int 0-5>, "reason": "<short 6-word explanation>"}'], ...
-        sectorDepths(1), sectorDepths(2), sectorDepths(3), sectorDepths(4), sectorDepths(5), ...
-        targetLabel, distToTarget, bearingDeg);
-
-    try
-        % Call local Ollama server (http://localhost:11434/api/generate)
-        payload = struct("model", modelName, ...
-                         "prompt", prompt, ...
-                         "images", {{b64Image}}, ...
-                         "format", "json", ...
-                         "stream", false);
-        opts = weboptions("MediaType", "application/json", "Timeout", 8);
-        resp = webwrite("http://localhost:11434/api/generate", payload, opts);
-        parsed = jsondecode(resp.response);
-        sec = parsed.sector;
-        if ischar(sec) || isstring(sec)
-            sec = str2double(sec); % Small VLMs often return "3" instead of 3
-        end
-        if ~isscalar(sec) || isnan(sec)
-            error("VLM returned invalid sector: %s", resp.response);
-        end
-        sector = max(0, min(5, round(double(sec))));
-        reason = string(parsed.reason);
-    catch ME
-        fprintf("VLM query failed, using fallback: %s\n", ME.message);
-        % Automatic fallback if Ollama is not running yet: score sectors by depth clearance + bearing alignment
-        if max(sectorDepths) < 8
-            sector = 0;
-            reason = "All sectors blocked (Local Fallback)";
-        else
-            sectorAnglesDeg = [-28, -14, 0, 14, 28];
-            scores = sectorDepths - 0.35 * abs(sectorAnglesDeg - bearingDeg);
-            [~, sector] = max(scores);
-            reason = "Open corridor toward target (Local Fallback)";
-        end
-    end
 end
 
 %% --- Helper: Grid Route Planner over the City Height Map ---

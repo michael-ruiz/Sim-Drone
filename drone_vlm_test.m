@@ -51,13 +51,19 @@ startXY  = [0; 0];
 goalXY   = [80; 110];  % Street intersection behind a city block from the start
 useRoute = true;       % false = pure reactive VLM toward the goal (no map)
 
+% Obstacles spawned in Unreal but NOT in city_map.mat, so the route can't avoid them:
+% [x y sizeX sizeY height] (m). This one blocks the road on the first route leg.
+unmappedObstacles = [40 2 4 8 20];
+
 cityMap = [];
-route   = goalXY';
+if isfile("city_map.mat")
+    cityMap = load("city_map.mat"); % Also used as the post-flight plot background
+end
+route = goalXY';
 if useRoute
-    if ~isfile("city_map.mat")
+    if isempty(cityMap)
         error("city_map.mat not found - run map_city_block.m first.");
     end
-    cityMap = load("city_map.mat");
     % Anything taller than 10 m blocks a 12 m cruise; keep 4 m from walls
     route  = planRoute(cityMap, startXY', goalXY', 10, 4);
     goalXY = route(end, :)'; % Planner snaps the goal to the nearest free street cell
@@ -80,6 +86,15 @@ cam = sim3d.sensors.Camera(ActorName="DroneCamera", ...
                            EnableDepthOutput=true);
 cam.Translation = [startXY', 2];
 add(world, cam);
+
+for k = 1:size(unmappedObstacles, 1)
+    ob = unmappedObstacles(k, :);
+    obstacle = sim3d.Actor(ActorName=sprintf("UnmappedObstacle%d", k));
+    createShape(obstacle, "box", ob(3:5));   % Size is [X Y Z]; Translation is the box center
+    obstacle.Translation = [ob(1), ob(2), ob(5) / 2];
+    obstacle.Color = [1 0.4 0];
+    add(world, obstacle);
+end
 
 % Shared State & VLM Configuration
 world.UserData.Time          = 0;
@@ -111,10 +126,11 @@ world.UserData.EscapeUntil   = -Inf;
 world.UserData.EscapeHeading = 0;
 world.UserData.EscapeDuration = 4.0;
 world.UserData.EscapeCount   = 0;
-world.UserData.StuckWindow   = 6.0;        % Stuck = under 2 m closer to the target in 6 s
-world.UserData.StuckMinProgress = 2.0;
+world.UserData.StuckWindow   = 6.0;        % Stuck = moved under 2 m in 6 s (not progress to the target:
+world.UserData.StuckMinMove  = 2.0;        %   following a street sideways to the goal is fine)
+world.UserData.BlockedDepth  = 8.0;        % All sectors closer than this = blocked (checked in code, not by the VLM)
 world.UserData.ProgressRefT  = 3.5;
-world.UserData.ProgressRefDist = Inf;
+world.UserData.ProgressRefPos = startXY;
 
 % Warm up Ollama so the first in-flight query doesn't time out while the model loads
 try
@@ -158,8 +174,18 @@ if ~isempty(histData)
         colormap(ax, flipud(gray)); clim(ax, [0 60]);
         cbMap = colorbar(ax); ylabel(cbMap, "Building height (m)");
     end
-    hRoute = plot(ax, [startXY(2); route(:,2)], [startXY(1); route(:,1)], "--o", ...
-                  Color=[1 0.55 0], LineWidth=1.5, MarkerFaceColor=[1 0.55 0]);
+    hObs = gobjects(0);
+    for k = 1:size(unmappedObstacles, 1)
+        ob = unmappedObstacles(k, :);
+        hObs = fill(ax, ob(2) + ob(4)/2 * [-1 1 1 -1], ob(1) + ob(3)/2 * [-1 -1 1 1], ...
+                    [1 0.4 0], EdgeColor="k", DisplayName="Unmapped Obstacle");
+    end
+    hRoute = gobjects(0);
+    if useRoute
+        hRoute = plot(ax, [startXY(2); route(:,2)], [startXY(1); route(:,1)], "--o", ...
+                      Color=[1 0.55 0], LineWidth=1.5, MarkerFaceColor=[1 0.55 0], ...
+                      DisplayName="Planned Route");
+    end
     hPath  = plot(ax, histData(:,2), histData(:,1), "b-", LineWidth=2);
     repPts = histData(:,4) == 1;
     vlmPts = histData(:,4) == 2;
@@ -170,10 +196,10 @@ if ~isempty(histData)
     hGoal = plot(ax, goalXY(2), goalXY(1), "kp", MarkerSize=18, MarkerFaceColor="y");
     axis(ax, "equal"); set(ax, YDir="normal");
     xlabel(ax, "Y (m, east)"); ylabel(ax, "X (m, north)");
-    title(ax, "Top-Down Path (Route + VLM Decisions + Depth Reflex)");
-    legend([hRoute, hPath, hRep, hEsc, hVLM, hGoal], ...
-           ["Planned Route", "Flight Path", "Depth Reflex Active", "Escape", "VLM Query Point", ...
-            sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))], Location="bestoutside");
+    title(ax, ternary(useRoute, "Top-Down Path (Route-Guided VLM)", "Top-Down Path (Reactive VLM, No Route)"));
+    set([hPath, hRep, hEsc, hVLM, hGoal], {"DisplayName"}, ...
+        {"Flight Path"; "Depth Reflex Active"; "Escape"; "VLM Query Point"; sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))});
+    legend([hRoute, hObs, hPath, hRep, hEsc, hVLM, hGoal], Location="bestoutside");
 
     exportgraphics(fig2, "vlm_run.png", Resolution=150);
     fprintf("Trajectory plot saved to vlm_run.png\n");
@@ -214,7 +240,7 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         sectorDepths(i) = prctile(strip(:), 2);
     end
     sectorAngles = deg2rad([-28, -14, 0, 14, 28]);
-    repulseDist  = 9.0;
+    repulseDist  = 6.0; % 9 m blocked any gap narrower than ~18 m
     zCruiseNED   = -12; % 12m cruise altitude
 
     vecToGoal  = ud.GoalXY - pos(1:2);
@@ -229,8 +255,6 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     if ud.WaypointIdx < size(ud.Route, 1) && norm(target - pos(1:2)) < ud.WaypointRadius
         ud.WaypointIdx = ud.WaypointIdx + 1;
         target = ud.Route(ud.WaypointIdx, :)';
-        ud.ProgressRefT    = t;
-        ud.ProgressRefDist = norm(target - pos(1:2));
         fprintf("t=%5.1fs pos=(%6.1f, %6.1f) waypoint reached -> next waypoint %d at (%.0f, %.0f)\n", ...
                 t, pos(1), pos(2), ud.WaypointIdx, target(1), target(2));
     end
@@ -244,14 +268,21 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         ud.Escaping        = false;
         ud.LastVLMTime     = -Inf; % Fresh VLM decision on the new view
         ud.ProgressRefT    = t;
-        ud.ProgressRefDist = distToTarget;
+        ud.ProgressRefPos  = pos(1:2);
     end
     if active && ~ud.Escaping && (t - ud.ProgressRefT) >= ud.StuckWindow
-        if ud.ProgressRefDist - distToTarget < ud.StuckMinProgress
-            ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, "stuck (no progress)");
+        moved = norm(pos(1:2) - ud.ProgressRefPos);
+        if moved < ud.StuckMinMove
+            ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, ...
+                             sprintf("stuck (moved %.1f m in %.0f s)", moved, ud.StuckWindow));
         end
-        ud.ProgressRefT    = t;
-        ud.ProgressRefDist = distToTarget;
+        ud.ProgressRefT   = t;
+        ud.ProgressRefPos = pos(1:2);
+    end
+    % Every sector walled off -> escape now instead of asking the VLM (it tends to answer "center")
+    if active && ~ud.Escaping && ~ud.Aligning && max(sectorDepths) < ud.BlockedDepth
+        ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, ...
+                         sprintf("all sectors < %.0f m", ud.BlockedDepth));
     end
 
     % Target outside the view -> turn to face it first (hysteresis: resume VLM within 10 deg)
@@ -318,17 +349,21 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
             yawTarget = ud.VLMHeading;
         end
 
-        % Repulsive safety vectors from 5-sector depth map
+        % Repulsive safety vectors from 5-sector depth map. Only the center sector pushes
+        % straight back; side sectors push mostly sideways so the drone centers itself
+        % in a gap instead of stalling in front of it.
         vRepulse = [0; 0];
         modeFlag = 0;
+        fwdDir   = [cos(yaw); sin(yaw)];
+        rightDir = [-sin(yaw); cos(yaw)];
         for i = 1:5
             d = sectorDepths(i);
             if d < repulseDist
                 modeFlag = 1;
-                obsBearing  = yaw + sectorAngles(i);
-                obsDirWorld = [cos(obsBearing); sin(obsBearing)];
-                pushMag     = 5.0 * ((repulseDist - d) / repulseDist);
-                vRepulse    = vRepulse - pushMag * obsDirWorld;
+                pushMag  = 5.0 * ((repulseDist - d) / repulseDist);
+                a        = sectorAngles(i);
+                backWeight = ternary(i == 3, 1.0, 0.3);
+                vRepulse = vRepulse - pushMag * (backWeight * cos(a) * fwdDir + sign(a) * rightDir);
             end
         end
 

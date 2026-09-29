@@ -25,7 +25,7 @@ hStatus = text(axRGB, 12, 28, "INITIALIZING...", Color="g", ...
                FontWeight="bold", FontSize=10, BackgroundColor="k");
 hVLMText = text(axRGB, 12, 450, "VLM: Waiting for takeoff...", Color="c", ...
                 FontWeight="bold", FontSize=10, BackgroundColor="k");
-title(axRGB, "Onboard RGB + Sector HUD [1-5] (HUD only, not sent to VLM)");
+title(axRGB, "Onboard RGB + Planner Sectors [1-5] + VLM Scene Analysis");
 
 axDepth = nexttile(tLayout, 2);
 hDepth = imagesc(axDepth, zeros(480, 640), [0 45]);
@@ -55,20 +55,25 @@ useRoute = true;       % false = pure reactive VLM toward the goal (no map)
 % [x y sizeX sizeY height] (m). This one blocks the road on the first route leg.
 unmappedObstacles = [40 2 4 8 20];
 
-% VLM configuration. Environment variables override the defaults for batch experiments:
-%   VLM_MODEL (e.g. qwen2.5vl:7b), VLM_OVERLAY (1 = draw numbered sectors into the image),
-%   VLM_RUN (log folder name under vlm_log/)
-vlmModel   = "qwen2.5vl:3b";   % Also tried: "llava" (strong sector-2 bias, ignored depths)
-vlmOverlay = false;
-if ~isempty(getenv("VLM_MODEL")),   vlmModel   = string(getenv("VLM_MODEL")); end
-if ~isempty(getenv("VLM_OVERLAY")), vlmOverlay = getenv("VLM_OVERLAY") == "1"; end
+% Sector planner: "code" = depth + bearing formula; "vlm" = ask the VLM for a sector.
+% eval_vlm_sectors.m showed small VLMs mostly answer "center" regardless of bearing, so
+% by default the VLM only runs as a scene analyst (what's ahead, how careful to be).
+% Environment variables override the defaults for batch experiments:
+%   VLM_PLANNER (code|vlm), VLM_MODEL (e.g. qwen2.5vl:7b),
+%   VLM_OVERLAY (1 = numbered sectors drawn into the image, vlm planner only), VLM_RUN (log folder)
+sectorPlanner = "code";
+vlmModel      = "qwen2.5vl:3b";   % Also tried: "llava" (strong sector-2 bias, ignored depths)
+vlmOverlay    = false;
+if ~isempty(getenv("VLM_PLANNER")), sectorPlanner = string(getenv("VLM_PLANNER")); end
+if ~isempty(getenv("VLM_MODEL")),   vlmModel      = string(getenv("VLM_MODEL")); end
+if ~isempty(getenv("VLM_OVERLAY")), vlmOverlay    = getenv("VLM_OVERLAY") == "1"; end
 runName = string(getenv("VLM_RUN"));
 if runName == ""
     runName = string(datetime("now", Format="yyyyMMdd_HHmmss"));
 end
 logDir = fullfile("vlm_log", runName);   % Raw frames + per-query inputs for offline VLM benchmarking
 if ~isfolder(logDir), mkdir(logDir); end
-fprintf("VLM: %s | overlay: %s | log: %s\n", vlmModel, string(vlmOverlay), logDir);
+fprintf("Planner: %s | VLM: %s | overlay: %s | log: %s\n", sectorPlanner, vlmModel, string(vlmOverlay), logDir);
 
 cityMap = [];
 if isfile("city_map.mat")
@@ -113,16 +118,23 @@ end
 
 % Shared State & VLM Configuration
 world.UserData.Time          = 0;
-world.UserData.LastVLMTime   = -10;
-world.UserData.VLMInterval   = 2.0;        % Query VLM every 2.0 seconds of sim time
+world.UserData.LastPlanTime   = -10;
+world.UserData.PlanInterval   = 2.0;        % New sector decision every 2.0 seconds of sim time
+world.UserData.SectorPlanner = sectorPlanner;
+world.UserData.SceneInterval = 3.0;        % VLM scene analysis every 3 seconds of sim time
+world.UserData.LastSceneTime = -Inf;
+world.UserData.SceneLog      = struct([]);
+world.UserData.SceneText     = "Scene: waiting for first analysis";
+world.UserData.CautionUntil  = -Inf;       % Medium/high hazard -> slower, wider clearance for 5 s
+world.UserData.CautionDuration = 5.0;
 world.UserData.GoalXY        = goalXY;
 world.UserData.Route         = route;      % Kx2 waypoints [x y]; last row is the goal
 world.UserData.WaypointIdx   = 1;
 world.UserData.WaypointRadius = 5.0;       % Advance to the next waypoint within 5 m
 world.UserData.UseRoute      = useRoute;
 world.UserData.ChosenSector  = 3;          % 0=Blocked, 1=Far Left, 2=Left, 3=Center, 4=Right, 5=Far Right
-world.UserData.VLMHeading    = 0;          % World yaw commanded by VLM (radians)
-world.UserData.VLMReason     = "Initial climb to cruise altitude";
+world.UserData.PlanHeading    = 0;          % World yaw commanded by VLM (radians)
+world.UserData.PlanReason     = "Initial climb to cruise altitude";
 world.UserData.OllamaModel   = vlmModel;
 world.UserData.VLMOverlay    = vlmOverlay;
 world.UserData.LogDir        = logDir;
@@ -173,8 +185,10 @@ arrived     = world.UserData.Arrived;
 escapeCount = world.UserData.EscapeCount;
 wpReached   = world.UserData.WaypointIdx - 1;
 queryLog    = world.UserData.QueryLog;
+sceneLog    = world.UserData.SceneLog;
 delete(world);
-save(fullfile(logDir, "queries.mat"), "queryLog", "vlmModel", "vlmOverlay");
+save(fullfile(logDir, "queries.mat"), "queryLog", "vlmModel", "vlmOverlay", "sectorPlanner");
+save(fullfile(logDir, "scenes.mat"), "sceneLog", "vlmModel", "unmappedObstacles");
 
 %% 6. Post-Flight Map (north/X up, east/Y right)
 if ~isempty(histData)
@@ -183,12 +197,21 @@ if ~isempty(histData)
     fprintf("Final position: (%.1f, %.1f), altitude %.1f m\n", histData(end,1), histData(end,2), histData(end,3));
     fprintf("Final distance to goal: %.1f m | Goal reached: %s\n", finalDist, string(arrived));
     fprintf("Waypoints passed: %d of %d | Escapes: %d\n", wpReached, size(route, 1) - 1, escapeCount);
-    fprintf("VLM queries: %d | Steps with depth reflex active: %d of %d\n", ...
-            nnz(histData(:,4) == 2), nnz(histData(:,4) == 1), size(histData, 1));
+    fprintf("Steps with depth reflex active: %d of %d | caution active: %d\n", ...
+            nnz(histData(:,4) == 1), size(histData, 1), nnz(histData(:,5)));
     if ~isempty(queryLog)
-        fprintf("VLM latency: mean %.2f s, max %.2f s | Sector picks [0..5]: %s\n", ...
-                mean([queryLog.latency]), max([queryLog.latency]), ...
+        fprintf("Planner (%s): %d decisions | latency mean %.2f s | sector picks [0..5]: %s\n", ...
+                sectorPlanner, numel(queryLog), mean([queryLog.latency]), ...
                 mat2str(histcounts([queryLog.sector], -0.5:1:5.5)));
+    end
+    if ~isempty(sceneLog)
+        hz = string({sceneLog.hazard});
+        fprintf("VLM scene: %d queries (%d failed) | latency mean %.2f s | hazard low/medium/high: %d/%d/%d | in_path: %d | caution triggers: %d\n", ...
+                numel(sceneLog), nnz(~[sceneLog.ok]), mean([sceneLog.latency]), ...
+                nnz(hz == "low"), nnz(hz == "medium"), nnz(hz == "high"), nnz([sceneLog.inPath]), ...
+                nnz([sceneLog.caution]));
+        [types, ~, idx] = unique(string({sceneLog.obstacle}));
+        fprintf("VLM obstacle labels: %s\n", strjoin(types + " x" + accumarray(idx, 1)', ", "));
     end
 
     fig2 = figure(Name="Cross-City VLM Navigation Trajectory", Color="w", Position=[100 60 900 800]);
@@ -213,18 +236,28 @@ if ~isempty(histData)
     end
     hPath  = plot(ax, histData(:,2), histData(:,1), "b-", LineWidth=2);
     repPts = histData(:,4) == 1;
-    vlmPts = histData(:,4) == 2;
     escPts = histData(:,4) == 3;
+    cauPts = histData(:,5) == 1;
+    hCau = scatter(ax, histData(cauPts,2), histData(cauPts,1), 40, [1 0.85 0], "filled");
     hRep = scatter(ax, histData(repPts,2), histData(repPts,1), 20, "r", "filled");
     hEsc = scatter(ax, histData(escPts,2), histData(escPts,1), 20, "m", "filled");
-    hVLM = scatter(ax, histData(vlmPts,2), histData(vlmPts,1), 50, "g", "filled", MarkerEdgeColor="k");
+    hScene = gobjects(0); hFlag = gobjects(0);
+    if ~isempty(sceneLog)
+        sp = vertcat(sceneLog.pos);
+        flagged = [sceneLog.caution];
+        hScene = scatter(ax, sp(:,2), sp(:,1), 50, "g", "filled", MarkerEdgeColor="k", ...
+                         DisplayName="VLM Scene Query");
+        hFlag  = scatter(ax, sp(flagged,2), sp(flagged,1), 110, [1 0.85 0], "d", "filled", ...
+                         MarkerEdgeColor="k", DisplayName="VLM Caution Trigger");
+    end
     hGoal = plot(ax, goalXY(2), goalXY(1), "kp", MarkerSize=18, MarkerFaceColor="y");
     axis(ax, "equal"); set(ax, YDir="normal");
     xlabel(ax, "Y (m, east)"); ylabel(ax, "X (m, north)");
-    title(ax, ternary(useRoute, "Top-Down Path (Route-Guided VLM)", "Top-Down Path (Reactive VLM, No Route)"));
-    set([hPath, hRep, hEsc, hVLM, hGoal], {"DisplayName"}, ...
-        {"Flight Path"; "Depth Reflex Active"; "Escape"; "VLM Query Point"; sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))});
-    legend([hRoute, hObs, hPath, hRep, hEsc, hVLM, hGoal], Location="bestoutside");
+    title(ax, sprintf("Top-Down Path (%s, %s planner, VLM scene analyst)", ...
+                      ternary(useRoute, "route", "no route"), sectorPlanner));
+    set([hPath, hCau, hRep, hEsc, hGoal], {"DisplayName"}, ...
+        {"Flight Path"; "Caution Active"; "Depth Reflex Active"; "Escape"; sprintf("Goal (%g, %g)", goalXY(1), goalXY(2))});
+    legend([hRoute, hObs, hPath, hCau, hRep, hEsc, hScene, hFlag, hGoal], Location="bestoutside");
 
     exportgraphics(fig2, "vlm_run.png", Resolution=150);
     fprintf("Trajectory plot saved to vlm_run.png\n");
@@ -291,7 +324,7 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     % --- 2. ESCAPE / STUCK HANDLING ---
     if ud.Escaping && t >= ud.EscapeUntil
         ud.Escaping        = false;
-        ud.LastVLMTime     = -Inf; % Fresh VLM decision on the new view
+        ud.LastPlanTime     = -Inf; % Fresh VLM decision on the new view
         ud.ProgressRefT    = t;
         ud.ProgressRefPos  = pos(1:2);
     end
@@ -318,21 +351,25 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
                     t, pos(1), pos(2), targetBearing);
         elseif ud.Aligning && abs(targetBearing) < 10
             ud.Aligning    = false;
-            ud.LastVLMTime = -Inf; % Query the VLM immediately on the new view
+            ud.LastPlanTime = -Inf; % Query the VLM immediately on the new view
         end
     end
 
-    % --- 3. HIGH-LEVEL VLM PLANNER (Runs Every 2.0s After Takeoff) ---
-    vlmTriggered = false;
-    if active && ~ud.Aligning && ~ud.Escaping && ((t - ud.LastVLMTime) >= ud.VLMInterval)
-        ud.LastVLMTime = t;
-        vlmTriggered   = true;
+    % --- 3. SECTOR PLANNER (every 2 s): depth + bearing formula, or the VLM ---
+    if active && ~ud.Aligning && ~ud.Escaping && ((t - ud.LastPlanTime) >= ud.PlanInterval)
+        ud.LastPlanTime = t;
 
         targetLabel = ternary(ud.UseRoute, "next route waypoint", "destination");
-        [chosenSector, reason, latency] = queryVLMNavigator(rgbFrame, sectorDepths, targetBearing, ...
-                                              distToTarget, targetLabel, ud.OllamaModel, ud.VLMOverlay);
+        if ud.SectorPlanner == "vlm"
+            [chosenSector, reason, latency] = queryVLMNavigator(rgbFrame, sectorDepths, targetBearing, ...
+                                                  distToTarget, targetLabel, ud.OllamaModel, ud.VLMOverlay);
+        else
+            chosenSector = chooseSector(sectorDepths, targetBearing);
+            reason  = "depth + bearing";
+            latency = 0;
+        end
         ud.ChosenSector = chosenSector;
-        ud.VLMReason    = sprintf("[Sector %d] %s", chosenSector, reason);
+        ud.PlanReason    = sprintf("[Sector %d] %s", chosenSector, reason);
         fprintf("t=%5.1fs pos=(%6.1f, %6.1f) target=%5.1fm @ %+4.0f deg | depths=[%s] -> sector %d (%.1fs) | %s\n", ...
                 t, pos(1), pos(2), distToTarget, targetBearing, ...
                 strjoin(compose("%.0f", sectorDepths), " "), chosenSector, latency, reason);
@@ -352,11 +389,50 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         if chosenSector == 0
             ud = startEscape(ud, t, pos, yaw, targetBearing, sectorDepths, "VLM reports all sectors blocked");
         else
-            ud.VLMHeading = yaw + sectorAngles(chosenSector);
+            ud.PlanHeading = yaw + sectorAngles(chosenSector);
         end
     end
 
-    % --- 4. COMBINE HEADING COMMAND WITH 20 Hz DEPTH REPULSION ---
+    % --- 4. VLM SCENE ANALYST (every 3 s): what is ahead, and how careful to be ---
+    sceneTriggered = false;
+    if active && ((t - ud.LastSceneTime) >= ud.SceneInterval)
+        ud.LastSceneTime = t;
+        sceneTriggered   = true;
+        [scene, latency] = describeSceneVLM(rgbFrame, ud.OllamaModel);
+        % Only act on what the VLM adds: buildings are already covered by the map and the
+        % depth reflex (and the 3b model calls nearly every frame "building ahead, medium").
+        cautionTrigger = scene.ok && scene.inPath && scene.hazard ~= "low" && ...
+                         ~any(scene.obstacle == ["none" "building"]);
+        if cautionTrigger
+            ud.CautionUntil = t + ud.CautionDuration;
+        end
+        ud.SceneText = sprintf("Scene: %s%s | hazard %s | %s", scene.obstacle, ...
+                               ternary(scene.inPath, " (in path)", ""), scene.hazard, scene.description);
+        fprintf("t=%5.1fs pos=(%6.1f, %6.1f) SCENE (%.1fs) center depth %2.0f m | %s%s\n", ...
+                t, pos(1), pos(2), latency, sectorDepths(3), ud.SceneText, ternary(cautionTrigger, " -> CAUTION", ""));
+
+        n = numel(ud.SceneLog) + 1;
+        imwrite(rgbFrame, fullfile(ud.LogDir, sprintf("s%03d.png", n)));
+        ud.SceneLog(n).t           = t;
+        ud.SceneLog(n).pos         = pos(1:2)';
+        ud.SceneLog(n).yaw         = yaw;
+        ud.SceneLog(n).depths      = sectorDepths;
+        ud.SceneLog(n).ok          = scene.ok;
+        ud.SceneLog(n).obstacle    = scene.obstacle;
+        ud.SceneLog(n).inPath      = scene.inPath;
+        ud.SceneLog(n).hazard      = scene.hazard;
+        ud.SceneLog(n).description = scene.description;
+        ud.SceneLog(n).caution     = cautionTrigger;
+        ud.SceneLog(n).latency     = latency;
+    end
+    caution = t < ud.CautionUntil;
+    cruiseSpeed = 3.8;
+    if caution
+        cruiseSpeed = 2.0;
+        repulseDist = 7.5;
+    end
+
+    % --- 5. COMBINE HEADING COMMAND WITH 20 Hz DEPTH REPULSION ---
     if t <= 3.5
         % Initial takeoff to 12m street cruise altitude
         vWorldCmd = -0.8 * pos(1:2);
@@ -381,10 +457,10 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
             vAttract  = [0; 0];
             yawTarget = targetHeading;
         else
-            % Attractive velocity along the VLM's chosen corridor heading
-            vAttract  = 3.8 * [cos(ud.VLMHeading); sin(ud.VLMHeading)];
-            % Keep the camera on the VLM corridor; repulsion only shifts velocity so hazards stay in view
-            yawTarget = ud.VLMHeading;
+            % Attractive velocity along the planner's chosen corridor heading
+            vAttract  = cruiseSpeed * [cos(ud.PlanHeading); sin(ud.PlanHeading)];
+            % Keep the camera on the chosen corridor; repulsion only shifts velocity so hazards stay in view
+            yawTarget = ud.PlanHeading;
         end
 
         % Repulsive safety vectors from 5-sector depth map. Only the center sector pushes
@@ -406,8 +482,9 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         end
 
         vWorldCmd = vAttract + vRepulse;
-        if norm(vWorldCmd) > 4.0
-            vWorldCmd = vWorldCmd * (4.0 / norm(vWorldCmd));
+        speedCap  = ternary(caution, 2.5, 4.0);
+        if norm(vWorldCmd) > speedCap
+            vWorldCmd = vWorldCmd * (speedCap / norm(vWorldCmd));
         end
 
         statusStr = sprintf("WP %d/%d: %.1f m | GOAL: %.1f m | Min Depth: %.0f m", ...
@@ -417,12 +494,16 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         elseif ud.Aligning
             statusStr = sprintf("TURNING TO TARGET (%+.0f deg) | %s", targetBearing, statusStr);
         end
+        if caution
+            statusStr = sprintf("CAUTION %.1f s | %s", ud.CautionUntil - t, statusStr);
+        end
         statusCol = "g";
+        if caution, statusCol = "y"; end
         if modeFlag == 1, statusCol = "r"; end
         if ud.Escaping, statusCol = "m"; end
     end
 
-    % --- 5. ACTUATE: Multirotor Attitude & Altitude Control ---
+    % --- 6. ACTUATE: Multirotor Attitude & Altitude Control ---
     yawErr = atan2(sin(yawTarget - yaw), cos(yawTarget - yaw));
     u.YawRate = max(-1.8, min(1.8, 2.4 * yawErr));
 
@@ -439,24 +520,24 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     vzUpCurr = -vel(3);
     u.Thrust = max(0, ud.HoverThrust + ud.Model.Configuration.Mass * (6.0 * altErr - 3.8 * vzUpCurr));
 
-    % Log flags: 0 = normal, 1 = depth reflex, 2 = VLM query, 3 = escape
+    % Log flags: 0 = normal, 1 = depth reflex, 2 = VLM scene query, 3 = escape; column 5 = caution
     logFlag = modeFlag;
     if ud.Escaping, logFlag = 3; end
-    if vlmTriggered, logFlag = 2; end
-    ud.History = [ud.History; pos(1), pos(2), -pos(3), logFlag];
+    if sceneTriggered, logFlag = 2; end
+    ud.History = [ud.History; pos(1), pos(2), -pos(3), logFlag, caution];
     ud.Control = u;
     world.UserData = ud;
 
-    % --- 6. UPDATE HUD ---
+    % --- 7. UPDATE HUD ---
     if isvalid(hRGB)
         set(hRGB, CData=rgbFrame);
         set(hDepth, CData=depthFrame);
         set(hStatus, String=sprintf("t = %.1f s | %s", t, statusStr), Color=statusCol);
-        set(hVLMText, String=sprintf("VLM Decision: %s", ud.VLMReason));
+        set(hVLMText, String=ud.SceneText);
 
         for i = 1:5
             if i == ud.ChosenSector
-                set(hBoxes(i), EdgeColor="c", LineStyle="-", LineWidth=3.0); % Cyan = VLM choice
+                set(hBoxes(i), EdgeColor="c", LineStyle="-", LineWidth=3.0); % Cyan = planner choice
             elseif sectorDepths(i) < repulseDist
                 set(hBoxes(i), EdgeColor="r", LineStyle="-", LineWidth=2.5); % Red = Obstacle
             else
@@ -465,6 +546,15 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         end
         drawnow limitrate;
     end
+end
+
+%% --- Helper: Deterministic Sector Choice ---
+function sector = chooseSector(sectorDepths, bearingDeg)
+    % Most clearance, penalized by angle from the target bearing (0.35 m of depth per degree).
+    % The small turn penalty breaks center/side ties at ~7 deg bearings, which otherwise
+    % zig-zag between sectors 2 and 4 on every decision.
+    sectorAnglesDeg = [-28, -14, 0, 14, 28];
+    [~, sector] = max(sectorDepths - 0.35 * abs(sectorAnglesDeg - bearingDeg) - 0.05 * abs(sectorAnglesDeg));
 end
 
 %% --- Helper: Start a Wall-Following Escape ---

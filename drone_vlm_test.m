@@ -64,6 +64,8 @@ unmappedObstacles = [40 2 4 8 20];
 sectorPlanner = "code";
 vlmModel      = "qwen2.5vl:3b";   % Also tried: "llava" (strong sector-2 bias, ignored depths)
 vlmOverlay    = false;
+scenePrompt   = "describe";       % describeSceneVLM variant (see eval_scene_prompts.m)
+if ~isempty(getenv("VLM_SCENE_PROMPT")), scenePrompt = string(getenv("VLM_SCENE_PROMPT")); end
 if ~isempty(getenv("VLM_PLANNER")), sectorPlanner = string(getenv("VLM_PLANNER")); end
 if ~isempty(getenv("VLM_MODEL")),   vlmModel      = string(getenv("VLM_MODEL")); end
 if ~isempty(getenv("VLM_OVERLAY")), vlmOverlay    = getenv("VLM_OVERLAY") == "1"; end
@@ -73,7 +75,8 @@ if runName == ""
 end
 logDir = fullfile("vlm_log", runName);   % Raw frames + per-query inputs for offline VLM benchmarking
 if ~isfolder(logDir), mkdir(logDir); end
-fprintf("Planner: %s | VLM: %s | overlay: %s | log: %s\n", sectorPlanner, vlmModel, string(vlmOverlay), logDir);
+fprintf("Planner: %s | VLM: %s | scene prompt: %s | overlay: %s | log: %s\n", ...
+        sectorPlanner, vlmModel, scenePrompt, string(vlmOverlay), logDir);
 
 cityMap = [];
 if isfile("city_map.mat")
@@ -125,8 +128,14 @@ world.UserData.SceneInterval = 3.0;        % VLM scene analysis every 3 seconds 
 world.UserData.LastSceneTime = -Inf;
 world.UserData.SceneLog      = struct([]);
 world.UserData.SceneText     = "Scene: waiting for first analysis";
-world.UserData.CautionUntil  = -Inf;       % Medium/high hazard -> slower, wider clearance for 5 s
+world.UserData.ScenePrompt   = scenePrompt;
+world.UserData.CautionUntil  = -Inf;       % VLM flag -> slower, wider clearance for at least 5 s ...
 world.UserData.CautionDuration = 5.0;
+world.UserData.CautionObstacle = [NaN; NaN]; % ... and until the flagged obstacle is behind the drone
+world.UserData.CautionAxis   = [1; 0];
+world.UserData.CautionHoldUntil = -Inf;
+world.UserData.CautionMaxHold = 30.0;      % Give up holding after 30 s (bad position estimate)
+world.UserData.CautionPassMargin = 5.0;    % "Behind" = 5 m past the estimated obstacle
 world.UserData.GoalXY        = goalXY;
 world.UserData.Route         = route;      % Kx2 waypoints [x y]; last row is the goal
 world.UserData.WaypointIdx   = 1;
@@ -188,7 +197,7 @@ queryLog    = world.UserData.QueryLog;
 sceneLog    = world.UserData.SceneLog;
 delete(world);
 save(fullfile(logDir, "queries.mat"), "queryLog", "vlmModel", "vlmOverlay", "sectorPlanner");
-save(fullfile(logDir, "scenes.mat"), "sceneLog", "vlmModel", "unmappedObstacles");
+save(fullfile(logDir, "scenes.mat"), "sceneLog", "vlmModel", "scenePrompt", "unmappedObstacles");
 
 %% 6. Post-Flight Map (north/X up, east/Y right)
 if ~isempty(histData)
@@ -398,13 +407,17 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
     if active && ((t - ud.LastSceneTime) >= ud.SceneInterval)
         ud.LastSceneTime = t;
         sceneTriggered   = true;
-        [scene, latency] = describeSceneVLM(rgbFrame, ud.OllamaModel);
-        % Only act on what the VLM adds: buildings are already covered by the map and the
-        % depth reflex (and the 3b model calls nearly every frame "building ahead, medium").
-        cautionTrigger = scene.ok && scene.inPath && scene.hazard ~= "low" && ...
-                         ~any(scene.obstacle == ["none" "building"]);
+        [scene, latency] = describeSceneVLM(rgbFrame, ud.OllamaModel, ud.ScenePrompt);
+        % scene.flag = something in the path that isn't part of the mapped city (buildings are
+        % already covered by the map and the depth reflex)
+        cautionTrigger = scene.ok && scene.flag;
         if cautionTrigger
             ud.CautionUntil = t + ud.CautionDuration;
+            % Estimate where the flagged obstacle is from the center-sector depth, and hold
+            % caution until the drone is past it
+            ud.CautionAxis      = [cos(yaw); sin(yaw)];
+            ud.CautionObstacle  = pos(1:2) + sectorDepths(3) * ud.CautionAxis;
+            ud.CautionHoldUntil = t + ud.CautionMaxHold;
         end
         ud.SceneText = sprintf("Scene: %s%s | hazard %s | %s", scene.obstacle, ...
                                ternary(scene.inPath, " (in path)", ""), scene.hazard, scene.description);
@@ -425,7 +438,9 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         ud.SceneLog(n).caution     = cautionTrigger;
         ud.SceneLog(n).latency     = latency;
     end
-    caution = t < ud.CautionUntil;
+    obstacleAhead = t < ud.CautionHoldUntil && ...
+                    dot(pos(1:2) - ud.CautionObstacle, ud.CautionAxis) < ud.CautionPassMargin;
+    caution = t < ud.CautionUntil || obstacleAhead;
     cruiseSpeed = 3.8;
     if caution
         cruiseSpeed = 2.0;
@@ -495,7 +510,8 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
             statusStr = sprintf("TURNING TO TARGET (%+.0f deg) | %s", targetBearing, statusStr);
         end
         if caution
-            statusStr = sprintf("CAUTION %.1f s | %s", ud.CautionUntil - t, statusStr);
+            toGo = ud.CautionPassMargin - dot(pos(1:2) - ud.CautionObstacle, ud.CautionAxis);
+            statusStr = sprintf("CAUTION (%.0f m to clear) | %s", max(0, toGo), statusStr);
         end
         statusCol = "g";
         if caution, statusCol = "y"; end

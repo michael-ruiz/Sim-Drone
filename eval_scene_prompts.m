@@ -1,32 +1,45 @@
 %% Offline Scene-Prompt Benchmark
-% Replays logged frames (vlm_log/*) through describeSceneVLM prompt variants and scores
-% the "non-map obstacle in path" flag against geometric ground truth: the unmapped box's
-% footprint projected into each frame's camera using the logged position and heading.
-%   positive  = box 2-40 m ahead and overlapping the middle +/-10 deg of the view
-%   negative  = box not visible at all (behind, or outside the +/-35 deg field of view)
-%   side      = box visible but off to the side (reported separately; flagging is debatable)
+% Replays logged frames (vlm_log/*) through describeSceneVLM prompt variants and models,
+% and scores the "non-map obstacle in path" flag against geometric ground truth: each
+% run's unmapped hazards (obstacleCourse.m) projected into the frame's camera using the
+% logged position and heading.
+%   positive  = a hazard 2-40 m ahead and overlapping the middle +/-10 deg of the view
+%   negative  = no hazard visible at all (behind, or outside the +/-35 deg field of view)
+%   side      = a hazard visible but off to the side (reported separately; flagging is debatable)
+% All positive and side frames are used; negatives are subsampled (fixed seed) to bound runtime.
+% Overrides: VLM_SCENE_MODELS, VLM_SCENE_VARIANTS (space-separated), VLM_SCENE_NEG (count)
 clear;
 
-variants = ["describe" "yesno" "yesno_center"];
-model    = "qwen2.5vl:3b";
-if ~isempty(getenv("VLM_MODEL")), model = string(getenv("VLM_MODEL")); end
+models   = ["qwen2.5vl:3b" "qwen2.5vl:7b"];
+variants = ["describe" "yesno"];
+maxNeg   = 60;
+if ~isempty(getenv("VLM_SCENE_MODELS")),   models   = split(string(getenv("VLM_SCENE_MODELS")))'; end
+if ~isempty(getenv("VLM_SCENE_VARIANTS")), variants = split(string(getenv("VLM_SCENE_VARIANTS")))'; end
+if ~isempty(getenv("VLM_SCENE_NEG")),      maxNeg   = str2double(getenv("VLM_SCENE_NEG")); end
 
-box      = [40 2 4 8];                               % [x y sizeX sizeY] of the unmapped obstacle
-route    = [75 6; 80 110];                           % Route waypoints in the logged runs
-halfFov  = atand(320 / 450);                         % ~35 deg
+route   = [75 6; 80 110];                            % Route waypoints in the logged runs
+halfFov = atand(320 / 450);                          % ~35 deg
 
-%% Gather frames with position + heading
-frames = struct("file", {}, "pos", {}, "yaw", {});
+%% Gather frames with position + heading + the run's obstacle course
+frames = struct("file", {}, "pos", {}, "yaw", {}, "course", {}, "run", {});
 runs = dir("vlm_log");
 runs = runs([runs.isdir] & ~startsWith({runs.name}, "."));
 for r = 1:numel(runs)
     runDir = fullfile(runs(r).folder, runs(r).name);
+    courseName = "box";                              % Runs logged before obstacleName existed
+    for f = ["scenes.mat" "queries.mat"]
+        if isfile(fullfile(runDir, f)) && ismember("obstacleName", who("-file", fullfile(runDir, f)))
+            S = load(fullfile(runDir, f), "obstacleName");
+            courseName = string(S.obstacleName);
+        end
+    end
     if isfile(fullfile(runDir, "scenes.mat"))
         S = load(fullfile(runDir, "scenes.mat"), "sceneLog");
         for k = 1:numel(S.sceneLog)
             f = fullfile(runDir, sprintf("s%03d.png", k));
             if isfile(f)
-                frames(end+1) = struct("file", f, "pos", S.sceneLog(k).pos(:)', "yaw", S.sceneLog(k).yaw); %#ok<SAGROW>
+                frames(end+1) = struct("file", f, "pos", S.sceneLog(k).pos(:)', "yaw", S.sceneLog(k).yaw, ...
+                                       "course", courseName, "run", string(runs(r).name)); %#ok<SAGROW>
             end
         end
     end
@@ -41,65 +54,87 @@ for r = 1:numel(runs)
             if isfile(f) && err < 0.5
                 d = route(w, :) - ql.pos(:)';
                 frames(end+1) = struct("file", f, "pos", ql.pos(:)', ...
-                                       "yaw", atan2(d(2), d(1)) - deg2rad(ql.bearing)); %#ok<SAGROW>
+                                       "yaw", atan2(d(2), d(1)) - deg2rad(ql.bearing), ...
+                                       "course", courseName, "run", string(runs(r).name)); %#ok<SAGROW>
             end
         end
     end
 end
+
+%% Ground truth from hazard footprints
+courses = containers.Map();
+label = strings(1, numel(frames)); hazDist = nan(1, numel(frames)); hazName = strings(1, numel(frames));
+for i = 1:numel(frames)
+    if ~isKey(courses, frames(i).course), courses(frames(i).course) = obstacleCourse(frames(i).course); end
+    hz = courses(frames(i).course).hazards;
+    label(i) = "negative";
+    for h = 1:numel(hz)
+        d   = hz(h).points - frames(i).pos;
+        fwd = d * [cos(frames(i).yaw); sin(frames(i).yaw)];
+        rgt = d * [-sin(frames(i).yaw); cos(frames(i).yaw)];
+        ang = atan2d(rgt, fwd);
+        ahead = fwd > 2;
+        inPath = ahead & abs(ang) <= 10 & fwd <= 40;
+        if any(inPath)
+            if label(i) ~= "positive" || min(fwd(inPath)) < hazDist(i)
+                hazDist(i) = min(fwd(inPath)); hazName(i) = hz(h).name;
+            end
+            label(i) = "positive";
+        elseif label(i) == "negative" && any(ahead & abs(ang) <= halfFov & fwd <= 80)
+            label(i) = "side";
+        end
+    end
+end
+
+% Keep all positive/side frames, subsample negatives with a fixed seed
+rng(1);
+negIdx = find(label == "negative");
+negIdx = negIdx(randperm(numel(negIdx), min(maxNeg, numel(negIdx))));
+keep = sort([find(label ~= "negative"), negIdx]);
+frames = frames(keep); label = label(keep); hazDist = hazDist(keep); hazName = hazName(keep);
 nF = numel(frames);
-
-%% Ground truth from the box footprint
-[gx, gy] = ndgrid(box(1) + (-box(3)/2:0.5:box(3)/2), box(2) + (-box(4)/2:0.5:box(4)/2));
-pts = [gx(:), gy(:)];
-label = strings(1, nF); boxDist = nan(1, nF);
-for i = 1:nF
-    d   = pts - frames(i).pos;
-    fwd = d * [cos(frames(i).yaw); sin(frames(i).yaw)];
-    rgt = d * [-sin(frames(i).yaw); cos(frames(i).yaw)];
-    ang = atan2d(rgt, fwd);
-    ahead = fwd > 2;
-    if any(ahead & abs(ang) <= 10 & fwd <= 40)
-        label(i) = "positive";
-        boxDist(i) = min(fwd(ahead & abs(ang) <= 10));
-    elseif any(ahead & abs(ang) <= halfFov & fwd <= 80)
-        label(i) = "side";
-    else
-        label(i) = "negative";
-    end
-end
-fprintf("%d frames: %d positive (box in path, %.0f-%.0f m), %d side, %d negative | model %s\n", nF, ...
-        nnz(label == "positive"), min(boxDist), max(boxDist), nnz(label == "side"), nnz(label == "negative"), model);
-
-%% Run every variant on every frame
-nV = numel(variants);
-flag = false(nV, nF); lat = zeros(nV, nF); ok = false(nV, nF); what = strings(nV, nF);
-try % Load the model before timing
-    webwrite("http://localhost:11434/api/generate", struct("model", model, "prompt", "", "stream", false), ...
-             weboptions("MediaType", "application/json", "Timeout", 120));
-catch ME
-    fprintf("Warm-up failed: %s\n", ME.message);
-end
-for v = 1:nV
-    for i = 1:nF
-        [sc, lat(v, i)] = describeSceneVLM(imread(frames(i).file), model, variants(v));
-        flag(v, i) = sc.flag; ok(v, i) = sc.ok;
-        what(v, i) = sc.obstacle + ": " + sc.description;
-    end
-    fprintf("done: %s\n", variants(v));
-end
-
-%% Score
 pos = label == "positive"; neg = label == "negative"; side = label == "side";
-near = pos & boxDist <= 20;
-fprintf("\n%-13s | %8s %12s %11s | %10s %9s | %7s %6s\n", "variant", "recall", "recall<=20m", "side flag", ...
-        "false flag", "precision", "latency", "failed");
-for v = 1:nV
-    f = flag(v, :);
-    fprintf("%-13s | %3d/%-3d  %6d/%-3d   %5d/%-3d  | %5d/%-3d  %8.0f%% | %6.2fs %6d\n", variants(v), ...
-            nnz(f & pos), nnz(pos), nnz(f & near), nnz(near), nnz(f & side), nnz(side), ...
-            nnz(f & neg), nnz(neg), 100 * nnz(f & pos) / max(1, nnz(f & ~side)), mean(lat(v, :)), nnz(~ok(v, :)));
-end
-fprintf("\nprecision = flags on positive frames / flags on positive + negative frames (side frames excluded)\n");
+fprintf("%d frames: %d positive (%s), %d side, %d negative (sampled)\n", nF, nnz(pos), ...
+        strjoin(compose("%s x%d", unique(hazName(pos))', arrayfun(@(n) nnz(hazName(pos) == n), unique(hazName(pos)))'), ", "), ...
+        nnz(side), nnz(neg));
 
-save(fullfile("vlm_log", "scene_benchmark.mat"), "variants", "model", "frames", "label", "boxDist", ...
+%% Run every model x variant on every frame
+configs = struct("model", {}, "variant", {});
+for m = models
+    for v = variants
+        configs(end+1) = struct("model", m, "variant", v); %#ok<SAGROW>
+    end
+end
+nC = numel(configs);
+flag = false(nC, nF); lat = zeros(nC, nF); ok = false(nC, nF); what = strings(nC, nF);
+for c = 1:nC
+    try % Load the model before timing
+        webwrite("http://localhost:11434/api/generate", struct("model", configs(c).model, "prompt", "", "stream", false), ...
+                 weboptions("MediaType", "application/json", "Timeout", 120));
+    catch ME
+        fprintf("Warm-up failed for %s: %s\n", configs(c).model, ME.message);
+    end
+    for i = 1:nF
+        [sc, lat(c, i)] = describeSceneVLM(imread(frames(i).file), configs(c).model, configs(c).variant);
+        flag(c, i) = sc.flag; ok(c, i) = sc.ok;
+        what(c, i) = sc.obstacle + ": " + sc.description;
+    end
+    fprintf("done: %s / %s\n", configs(c).model, configs(c).variant);
+end
+
+%% Score (overall, and per hazard type)
+near = pos & hazDist <= 20;
+hazTypes = unique(hazName(pos));
+fprintf("\n%-13s %-13s | %8s %11s %s| %10s %10s | %7s %6s\n", "model", "variant", "recall", "recall<=20m", ...
+        sprintf("%-14s", hazTypes + " "), "side flag", "false flag", "latency", "failed");
+for c = 1:nC
+    f = flag(c, :);
+    perType = arrayfun(@(n) sprintf("%2d/%-2d", nnz(f & pos & hazName == n), nnz(pos & hazName == n)), hazTypes);
+    fprintf("%-13s %-13s | %3d/%-3d  %5d/%-3d   %s | %5d/%-3d  %5d/%-3d | %6.2fs %6d\n", configs(c).model, configs(c).variant, ...
+            nnz(f & pos), nnz(pos), nnz(f & near), nnz(near), sprintf("%-14s", perType), ...
+            nnz(f & side), nnz(side), nnz(f & neg), nnz(neg), mean(lat(c, :)), nnz(~ok(c, :)));
+end
+fprintf("\nper-hazard columns: %s\n", strjoin(hazTypes, " | "));
+
+save(fullfile("vlm_log", "scene_benchmark.mat"), "configs", "frames", "label", "hazDist", "hazName", ...
      "flag", "lat", "ok", "what");

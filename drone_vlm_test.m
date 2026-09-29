@@ -51,9 +51,11 @@ startXY  = [0; 0];
 goalXY   = [80; 110];  % Street intersection behind a city block from the start
 useRoute = true;       % false = pure reactive VLM toward the goal (no map)
 
-% Obstacles spawned in Unreal but NOT in city_map.mat, so the route can't avoid them:
-% [x y sizeX sizeY height] (m). This one blocks the road on the first route leg.
-unmappedObstacles = [40 2 4 8 20];
+% Obstacles spawned in Unreal but NOT in city_map.mat, so the route can't avoid them
+% (see obstacleCourse.m): "crane_tree" (default), "box", or "none". Override: VLM_OBSTACLES
+obstacleName = "crane_tree";
+if ~isempty(getenv("VLM_OBSTACLES")), obstacleName = string(getenv("VLM_OBSTACLES")); end
+course = obstacleCourse(obstacleName);
 
 % Sector planner: "code" = depth + bearing formula; "vlm" = ask the VLM for a sector.
 % eval_vlm_sectors.m showed small VLMs mostly answer "center" regardless of bearing, so
@@ -65,7 +67,12 @@ sectorPlanner = "code";
 vlmModel      = "qwen2.5vl:3b";   % Also tried: "llava" (strong sector-2 bias, ignored depths)
 vlmOverlay    = false;
 scenePrompt   = "describe";       % describeSceneVLM variant (see eval_scene_prompts.m)
+% Narration only by default: on the crane/tree course, VLM-triggered caution made the flight
+% ~50% slower with no measurable clearance gain; the code planner + depth reflex handled it.
+% VLM_SCENE_ACT=1 turns caution back on (for hazards the depth sensor can't see).
+sceneActs     = false;
 if ~isempty(getenv("VLM_SCENE_PROMPT")), scenePrompt = string(getenv("VLM_SCENE_PROMPT")); end
+if ~isempty(getenv("VLM_SCENE_ACT")),    sceneActs   = getenv("VLM_SCENE_ACT") ~= "0"; end
 if ~isempty(getenv("VLM_PLANNER")), sectorPlanner = string(getenv("VLM_PLANNER")); end
 if ~isempty(getenv("VLM_MODEL")),   vlmModel      = string(getenv("VLM_MODEL")); end
 if ~isempty(getenv("VLM_OVERLAY")), vlmOverlay    = getenv("VLM_OVERLAY") == "1"; end
@@ -75,8 +82,9 @@ if runName == ""
 end
 logDir = fullfile("vlm_log", runName);   % Raw frames + per-query inputs for offline VLM benchmarking
 if ~isfolder(logDir), mkdir(logDir); end
-fprintf("Planner: %s | VLM: %s | scene prompt: %s | overlay: %s | log: %s\n", ...
-        sectorPlanner, vlmModel, scenePrompt, string(vlmOverlay), logDir);
+fprintf("Planner: %s | VLM: %s | scene prompt: %s (%s) | obstacles: %s | log: %s\n", ...
+        sectorPlanner, vlmModel, scenePrompt, ternary(sceneActs, "acts", "narration only"), ...
+        obstacleName, logDir);
 
 cityMap = [];
 if isfile("city_map.mat")
@@ -110,14 +118,19 @@ cam = sim3d.sensors.Camera(ActorName="DroneCamera", ...
 cam.Translation = [startXY', 2];
 add(world, cam);
 
-for k = 1:size(unmappedObstacles, 1)
-    ob = unmappedObstacles(k, :);
+for k = 1:numel(course.parts)
+    p = course.parts(k);
     obstacle = sim3d.Actor(ActorName=sprintf("UnmappedObstacle%d", k));
-    createShape(obstacle, "box", ob(3:5));   % Size is [X Y Z]; Translation is the box center
-    obstacle.Translation = [ob(1), ob(2), ob(5) / 2];
-    obstacle.Color = [1 0.4 0];
+    createShape(obstacle, p.shape, p.size);   % Size is [X Y Z]; Translation is the shape center
+    obstacle.Translation = p.center;
+    obstacle.Color = p.color;
     add(world, obstacle);
 end
+
+% Human-readable mission narration from the VLM scene analyst
+narrationFile = fullfile(logDir, "narration.txt");
+writelines(sprintf("Mission narration - %s, %s, obstacles: %s, scene output %s", ...
+                   runName, vlmModel, obstacleName, ternary(sceneActs, "acted on", "logged only")), narrationFile);
 
 % Shared State & VLM Configuration
 world.UserData.Time          = 0;
@@ -129,6 +142,8 @@ world.UserData.LastSceneTime = -Inf;
 world.UserData.SceneLog      = struct([]);
 world.UserData.SceneText     = "Scene: waiting for first analysis";
 world.UserData.ScenePrompt   = scenePrompt;
+world.UserData.SceneActs     = sceneActs;
+world.UserData.NarrationFile = narrationFile;
 world.UserData.CautionUntil  = -Inf;       % VLM flag -> slower, wider clearance for at least 5 s ...
 world.UserData.CautionDuration = 5.0;
 world.UserData.CautionObstacle = [NaN; NaN]; % ... and until the flagged obstacle is behind the drone
@@ -197,7 +212,8 @@ queryLog    = world.UserData.QueryLog;
 sceneLog    = world.UserData.SceneLog;
 delete(world);
 save(fullfile(logDir, "queries.mat"), "queryLog", "vlmModel", "vlmOverlay", "sectorPlanner");
-save(fullfile(logDir, "scenes.mat"), "sceneLog", "vlmModel", "scenePrompt", "unmappedObstacles");
+save(fullfile(logDir, "scenes.mat"), "sceneLog", "vlmModel", "scenePrompt", "sceneActs", "obstacleName");
+save(fullfile(logDir, "queries.mat"), "obstacleName", "-append");
 
 %% 6. Post-Flight Map (north/X up, east/Y right)
 if ~isempty(histData)
@@ -232,10 +248,11 @@ if ~isempty(histData)
         cbMap = colorbar(ax); ylabel(cbMap, "Building height (m)");
     end
     hObs = gobjects(0);
-    for k = 1:size(unmappedObstacles, 1)
-        ob = unmappedObstacles(k, :);
-        hObs = fill(ax, ob(2) + ob(4)/2 * [-1 1 1 -1], ob(1) + ob(3)/2 * [-1 -1 1 1], ...
-                    [1 0.4 0], EdgeColor="k", DisplayName="Unmapped Obstacle");
+    for k = 1:numel(course.hazards)
+        hp = course.hazards(k).points;
+        hull = convhull(hp(:,1), hp(:,2));
+        hObs = fill(ax, hp(hull,2), hp(hull,1), [1 0.4 0], EdgeColor="k", DisplayName="Unmapped Obstacle");
+        text(ax, max(hp(:,2)) + 2, mean(hp(:,1)), course.hazards(k).name, FontSize=8, FontWeight="bold");
     end
     hRoute = gobjects(0);
     if useRoute
@@ -411,18 +428,25 @@ function vlmAndReflexLoop(world, ~, hRGB, hDepth, hStatus, hVLMText, hBoxes, col
         % scene.flag = something in the path that isn't part of the mapped city (buildings are
         % already covered by the map and the depth reflex)
         cautionTrigger = scene.ok && scene.flag;
-        if cautionTrigger
+        writelines(sprintf("[t=%5.1fs] at (%5.1f, %5.1f) heading %4.0f deg: %s - %s%s", t, pos(1), pos(2), ...
+                           mod(rad2deg(yaw), 360), scene.obstacle, scene.description, ...
+                           ternary(cautionTrigger, "  [FLAGGED]", "")), ud.NarrationFile, WriteMode="append");
+        if cautionTrigger && ud.SceneActs
             ud.CautionUntil = t + ud.CautionDuration;
-            % Estimate where the flagged obstacle is from the center-sector depth, and hold
-            % caution until the drone is past it
-            ud.CautionAxis      = [cos(yaw); sin(yaw)];
-            ud.CautionObstacle  = pos(1:2) + sectorDepths(3) * ud.CautionAxis;
-            ud.CautionHoldUntil = t + ud.CautionMaxHold;
+            % With a center-sector depth return, estimate where the flagged obstacle is and
+            % hold caution until the drone is past it. At the 45 m clamp there's no return,
+            % so the estimate would be arbitrary: rely on the timer alone.
+            if sectorDepths(3) < 45
+                ud.CautionAxis      = [cos(yaw); sin(yaw)];
+                ud.CautionObstacle  = pos(1:2) + sectorDepths(3) * ud.CautionAxis;
+                ud.CautionHoldUntil = t + ud.CautionMaxHold;
+            end
         end
         ud.SceneText = sprintf("Scene: %s%s | hazard %s | %s", scene.obstacle, ...
                                ternary(scene.inPath, " (in path)", ""), scene.hazard, scene.description);
         fprintf("t=%5.1fs pos=(%6.1f, %6.1f) SCENE (%.1fs) center depth %2.0f m | %s%s\n", ...
-                t, pos(1), pos(2), latency, sectorDepths(3), ud.SceneText, ternary(cautionTrigger, " -> CAUTION", ""));
+                t, pos(1), pos(2), latency, sectorDepths(3), ud.SceneText, ...
+                ternary(cautionTrigger, ternary(ud.SceneActs, " -> CAUTION", " -> flagged (not acted on)"), ""));
 
         n = numel(ud.SceneLog) + 1;
         imwrite(rgbFrame, fullfile(ud.LogDir, sprintf("s%03d.png", n)));
